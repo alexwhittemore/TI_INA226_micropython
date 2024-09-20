@@ -94,6 +94,7 @@ _CONFIG_MODE_SANDBVOLT_CONTINUOUS = const(0x0007)
 
 # SHUNT VOLTAGE REGISTER (R)
 _REG_SHUNTVOLTAGE = const(0x01)
+_SHUNT_V_LSB = const(0.0000025)
 
 # BUS VOLTAGE REGISTER (R)
 _REG_BUSVOLTAGE = const(0x02)
@@ -117,19 +118,21 @@ def _to_signed(num):
 
 class INA226:
     """Driver for the INA226 current sensor"""
-    def __init__(self, i2c_device, addr=0x40):
+    def __init__(self, i2c_device, addr=0x40, shunt_resistance=0.1):
         self.i2c_device = i2c_device
-
         self.i2c_addr = addr
-        self.buf = bytearray(2)
-        # Multiplier in mA used to determine current from raw reading
-        self._current_lsb = 0
-        # Multiplier in W used to determine power from raw reading
-        self._power_lsb = 0
+        self.shunt_resistance = shunt_resistance
 
-        # Set chip to known config values to start
-        self._cal_value = 4096
-        self.set_calibration()
+        self.buf = bytearray(2)
+        self._current_lsb = 0       # Multiplier in mA used to determine current from raw reading
+        self._power_lsb = 0         # Multiplier in W used to determine power from raw reading
+
+        try:
+            self.set_calibration()
+        except Exception as e:
+            print("Exception during init:")
+            print(e)
+
 
     def _write_register(self, reg, value):
         self.buf[0] = (value >> 8) & 0xFF
@@ -143,14 +146,22 @@ class INA226:
 
     @property
     def shunt_voltage(self):
-        """The shunt voltage (between V+ and V-) in Volts (so +-.327V)"""
-        value = _to_signed(self._read_register(_REG_SHUNTVOLTAGE))
-        # The least signficant bit is 10uV which is 0.00001 volts
-        return value * 0.00001
+        """The shunt voltage (between V+ and V-) in Volts
+        
+        The INA226 has a fixed gain and a fixed LSB scale of 2.5uV.
+        Therefore, the full-scale range is +/-0.08192 i.e. +/- 2.5uV*2^15
+        """
+        shunt_v = _to_signed(self._read_register(_REG_SHUNTVOLTAGE))
+        return shunt_v * _SHUNT_V_LSB # Mulitply register by fixed LSB scale of 2.5uV
 
     @property
     def bus_voltage(self):
-        """The bus voltage (between V- and GND) in Volts"""
+        """The bus voltage in Volts, not to exceed 36V
+
+        Vbus could be GND to V-, V+, or something else depending on your wiring.
+        
+        The INA226 has a fixed LSB scale of 1.25mV and full-scale range of 0 to 40.96 (1.25mV*2^15), but the hardware is limited to 36V.
+        """
         raw_voltage = self._read_register(_REG_BUSVOLTAGE)
         # voltage in millVolt is register content multiplied with 1.25mV/bit
         voltage_mv = raw_voltage * 1.25
@@ -159,7 +170,8 @@ class INA226:
 
     @property
     def current(self):
-        """The current through the shunt resistor in milliamps."""
+        """The current through the shunt resistor in milliamps, from INA226 register"""
+
         # Sometimes a sharp load will reset the INA219, which will
         # reset the cal register, meaning CURRENT and POWER will
         # not be available ... athis by always setting a cal
@@ -171,41 +183,41 @@ class INA226:
         return raw_current * self._current_lsb
     
     @property
+    def current_calc(self):
+        """The current through the shunt resistor, calculated off-board
+        
+        The INA226 gives raw shunt voltage, so knowing the resistor value in Python, we can just calculate the current without any calibration step.
+        """
+
+        return self.shunt_voltage/self.shunt_resistance
+
+    
+    @property
     def power(self):
         # INA226 stores the calculated power in this register        
         raw_power = _to_signed(self._read_register(_REG_POWER))
         # Calculated power is derived by multiplying raw power value with the power LSB
         return raw_power * self._power_lsb
-# Example calculations for calibration register value, current LSB and power LSB
-# 1. Assuming a 100milliOhm resistor as shunt
-# RSHUNT = 0.1
-#
-# 2. Determine current_lsb
-# Assuming a maximum expected current of 3.6A
-# current_lsb = MaxExpected_I / (2^15)
-# current_lsb = 3.6A / (2^15)
-# current_lsb = 0.0001098632813
-# -> Rounding to "nicer" numbers:
-# current_lsb = 0.0001
-#
-# 3. Setting the power LSB
-# power_lsb = 25 * current_lsb
-# power_lsb = 25 * 0.0001
-# power_lsb = 0.0025
-#
-# 4. Determine calibration register value
-# cal_value = 0.00512 / (RSHUNT * current_lsb)
-# cal_value = 0.00512 / (0.1 * 0.0001)
-# cal_value = 512
-#
-#
+
+    def calc_calibration(self):
+        """Calculate calibration values for using the current register using sensible defaults
+        """
+        
+        # The ADC LSB for the shunt voltage measurement is fixed at 2.5uV, full scale of +/- 81.92mV,
+        # so I think it maximizes resolution to set current LSB to 2.5uV/Rshunt. Since the calibration
+        # register is an integer, we'll calculate that first then back-out the actual LSB scale.
+        self._cal_value = int(0.00512/.0000025)
+        self._current_lsb = .00512/(self._cal_value*self.shunt_resistance)
+        # The power LSB is fixed as a multiple of the current LSB
+        self._power_lsb = 25*self._current_lsb
+
     def set_calibration(self):  # pylint: disable=invalid-name
-        """Configures to INA226 to be able to measure up to 36V and 2A
-            of current. Counter overflow occurs at 3.2A.
-           ..note :: These calculations assume a 0.1 shunt ohm resistor"""
-        self._current_lsb = .0001
-        self._cal_value = 512
-        self._power_lsb = .0025  
+        """Configures INA226 with accurate current and power registers
+        
+        The current and power registers are basically for convenience and maybe processing efficiency,
+        since we could just read raw shunt voltage and divide by the shunt resistor value.  
+        """
+        self.calc_calibration()
         self._write_register(_REG_CALIBRATION, self._cal_value)
         
         config = (_CONFIG_CONST_BITS |
