@@ -2,6 +2,7 @@
 #
 # Copyright (c) 2017 Dean Miller for Adafruit Industries
 # Copyright (c) 2020 Christian Becker
+# Copyright (c) 2024 Alex Whittemore
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -95,6 +96,7 @@ _CONFIG_MODE_SANDBVOLT_CONTINUOUS = const(0x0007)
 # SHUNT VOLTAGE REGISTER (R)
 _REG_SHUNTVOLTAGE = const(0x01)
 _SHUNT_V_LSB = const(0.0000025)
+_BUS_V_LSB = const(0.00125)
 
 # BUS VOLTAGE REGISTER (R)
 _REG_BUSVOLTAGE = const(0x02)
@@ -108,6 +110,22 @@ _REG_CURRENT = const(0x04)
 # CALIBRATION REGISTER (R/W)
 _REG_CALIBRATION = const(0x05)
 # pylint: enable=bad-whitespace
+
+_REG_MASK_ENABLE = const(0x06)
+_REG_ALERT_LIMIT = const(0x07)
+ALERT_MODE_SHUNT_OVERVOLT = const(0x8000)
+ALERT_MODE_SHUNT_UNDERVOLT = const(0x4000)
+ALERT_MODE_BUS_OVERVOLT = const(0x2000)
+ALERT_MODE_BUS_UNDERVOLT = const(0x1000)
+ALERT_MODE_OVERPOWER = const(0x800)
+_ALERT_MODE_CONVERSION_READY = const(0x400)
+_MASK_ENABLE_AFF_BIT = const(0x10)
+_MASK_ENABLE_CONV_READY_BIT = const(0x8)
+_MASK_ENABLE_MATH_OVERFLOW_BIT = const(0x4)
+_MASK_ENABLE_ALERT_POLARITY_BIT = const(0x2)
+_MASK_ENABLE_ALERT_LATCH_ENABLE = const(0x1)
+
+
 
 
 def _to_signed(num):
@@ -163,10 +181,7 @@ class INA226:
         The INA226 has a fixed LSB scale of 1.25mV and full-scale range of 0 to 40.96 (1.25mV*2^15), but the hardware is limited to 36V.
         """
         raw_voltage = self._read_register(_REG_BUSVOLTAGE)
-        # voltage in millVolt is register content multiplied with 1.25mV/bit
-        voltage_mv = raw_voltage * 1.25
-        # Return Volts instead of milliVolts
-        return voltage_mv * 0.001
+        return raw_voltage * _BUS_V_LSB
 
     @property
     def current(self):
@@ -235,3 +250,74 @@ class INA226:
         self._cal_value = calValue        
         self._write_register(_REG_CALIBRATION, self._cal_value)
         self._write_register(_REG_CONFIG, config)
+
+    def shunt_v_from_amps(self, current):
+        """Get the shunt voltage for a given current, given our resistor.
+        Helper for set_alert_mode() since that takes a voltage
+        
+        current: current in amps through the shunt.
+        """
+        shunt_v = current*self.shunt_resistance
+        if shunt_v > 0.08192:
+            raise ValueError(f"Current limit too high, must be under {.08192/self.shunt_resistance}")
+        return shunt_v
+
+    def set_alert_mode(self, alert_mode, limit_amps=None, alert_limit=None, latch=False, alert_polarity=0, conversion_ready=False):
+        """Set alert mode, with options. Limitation: currently doesn't support negative values
+
+        alert_mode:         see below. Set to None if you just want to use conversion_ready
+        limit_amps:         If the mode is shunt overvolt or undervolt, calculate the voltage from this current
+                            Ignores alert_limit.
+        alert_limit:        (float) limit value in volts or watts
+                            (int) raw value written directly to register
+        latch:              if True, hold the alert pin until we manually clear it by reading this register
+                            if False, the alert de-asserts as soon as the condition clears.
+        alert_polarity:     0 is active-low on the alert pin, 1 is active-high (open-drain)
+        conversion_ready:   assert the alert pin when a conversion is ready to read. Can be done independent 
+                            of other modes. TODO: this has implications this library doesn't yet handle.
+
+        alert_mode can be:
+        ina226.ALERT_MODE_SHUNT_OVERVOLT    assert alert pin if shunt voltage register exceeds alert_limit
+        ina226.ALERT_MODE_SHUNT_UNDERVOLT   ... if shunt voltage register is below alert_limit
+        ina226.ALERT_MODE_BUS_OVERVOLT      ... if bus voltage register exceeds alert_limit
+        ina226.ALERT_MODE_BUS_UNDERVOLT     ... if bus voltage register is below alert_limit
+        ina226.ALERT_MODE_OVERPOWER         ... if power register exceeds alert_limit
+        """
+        
+        if alert_mode and alert_limit is None and limit_amps is None:
+            raise ValueError("alert_limit must be set for this alert mode")
+        
+        # Validate alert_mode makes sense, and set alert_limit to an int if it isn't already.
+        if alert_mode == ALERT_MODE_SHUNT_OVERVOLT or alert_mode == ALERT_MODE_SHUNT_UNDERVOLT:
+            if limit_amps:
+                alert_limit = self.shunt_v_from_amps(limit_amps)
+            if type(alert_limit) is float:
+                alert_limit = int(alert_limit/_SHUNT_V_LSB)
+        elif alert_mode == ALERT_MODE_BUS_OVERVOLT or alert_mode == ALERT_MODE_BUS_UNDERVOLT:
+            if type(alert_limit) is float:
+                alert_limit = int(alert_limit/_BUS_V_LSB)
+        elif alert_mode == ALERT_MODE_OVERPOWER:
+            if type(alert_limit) is float:
+                alert_limit = int(alert_limit/self._power_lsb)
+        elif not conversion_ready:
+            raise ValueError("Unknown alert mode")
+
+        if type(alert_limit) is int and (alert_limit > 32768 or alert_limit < 0):
+            raise ValueError(f"alert_limit is out of bounds. Max shunt_v 81.92mV, bus_v 36v, power {32768*self._power_lsb}w")
+        
+        alert_mode_reg = 0x0
+        if alert_mode:
+            alert_mode_reg |= alert_mode
+        if conversion_ready:
+            alert_mode_reg |= _ALERT_MODE_CONVERSION_READY
+        if alert_polarity:
+            alert_mode_reg |= _MASK_ENABLE_ALERT_POLARITY_BIT
+        if latch:
+            alert_mode_reg |= _MASK_ENABLE_ALERT_LATCH_ENABLE
+
+        self._write_register(_REG_MASK_ENABLE, alert_mode_reg)
+        self._write_register(_REG_ALERT_LIMIT, alert_limit)
+
+    def check_clear_alert(self):
+        """Returns whether there was an alert to clear. There's no way to read without clearing."""
+        return bool(self._read_register(_REG_MASK_ENABLE) & _MASK_ENABLE_AFF_BIT)
