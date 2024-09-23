@@ -118,6 +118,7 @@ ALERT_MODE_SHUNT_UNDERVOLT = const(0x4000)
 ALERT_MODE_BUS_OVERVOLT = const(0x2000)
 ALERT_MODE_BUS_UNDERVOLT = const(0x1000)
 ALERT_MODE_OVERPOWER = const(0x800)
+ALERT_MODE_DISABLED = const(0x0)
 _ALERT_MODE_CONVERSION_READY = const(0x400)
 _MASK_ENABLE_AFF_BIT = const(0x10)
 _MASK_ENABLE_CONV_READY_BIT = const(0x8)
@@ -214,7 +215,7 @@ class INA226:
         # Calculated power is derived by multiplying raw power value with the power LSB
         return raw_power * self._power_lsb
 
-    def calc_calibration(self):
+    def _calc_calibration(self):
         """Calculate calibration values for using the current register using sensible defaults
         """
         
@@ -232,7 +233,7 @@ class INA226:
         The current and power registers are basically for convenience and maybe processing efficiency,
         since we could just read raw shunt voltage and divide by the shunt resistor value.  
         """
-        self.calc_calibration()
+        self._calc_calibration()
         self._write_register(_REG_CALIBRATION, self._cal_value)
         
         config = (_CONFIG_CONST_BITS |
@@ -251,7 +252,7 @@ class INA226:
         self._write_register(_REG_CALIBRATION, self._cal_value)
         self._write_register(_REG_CONFIG, config)
 
-    def shunt_v_from_amps(self, current):
+    def _shunt_v_from_amps(self, current):
         """Get the shunt voltage for a given current, given our resistor.
         Helper for set_alert_mode() since that takes a voltage
         
@@ -284,13 +285,14 @@ class INA226:
         ina226.ALERT_MODE_OVERPOWER         ... if power register exceeds alert_limit
         """
         
-        if alert_mode and alert_limit is None and limit_amps is None:
+        if not alert_mode is None and alert_mode > ALERT_MODE_DISABLED and alert_limit is None and limit_amps is None:
+            # No alert_limit needed if alert_mode is none (just doing conversion_ready) or 0 (disabled)
             raise ValueError("alert_limit must be set for this alert mode")
         
         # Validate alert_mode makes sense, and set alert_limit to an int if it isn't already.
         if alert_mode == ALERT_MODE_SHUNT_OVERVOLT or alert_mode == ALERT_MODE_SHUNT_UNDERVOLT:
             if limit_amps:
-                alert_limit = self.shunt_v_from_amps(limit_amps)
+                alert_limit = self._shunt_v_from_amps(limit_amps)
             if type(alert_limit) is float:
                 alert_limit = int(alert_limit/_SHUNT_V_LSB)
         elif alert_mode == ALERT_MODE_BUS_OVERVOLT or alert_mode == ALERT_MODE_BUS_UNDERVOLT:
@@ -299,6 +301,8 @@ class INA226:
         elif alert_mode == ALERT_MODE_OVERPOWER:
             if type(alert_limit) is float:
                 alert_limit = int(alert_limit/self._power_lsb)
+        elif alert_mode == ALERT_MODE_DISABLED:
+            alert_limit = 0
         elif not conversion_ready:
             raise ValueError("Unknown alert mode")
 
